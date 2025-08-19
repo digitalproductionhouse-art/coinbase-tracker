@@ -1,32 +1,30 @@
 name: Update Coinbase Sheet
 
 on:
+  workflow_dispatch:   # allows you to trigger manually
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes
-  workflow_dispatch:         # allows manual "Run workflow"
+    - cron: "0 * * * *"   # runs every hour (adjust as needed)
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pyjwt cryptography
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run script
+        run: python main.py
         env:
-          COINBASE_KEY_ID: ${{ secrets.COINBASE_KEY_ID }}
           COINBASE_ORG_ID: ${{ secrets.COINBASE_ORG_ID }}
+          COINBASE_KEY_ID: ${{ secrets.COINBASE_KEY_ID }}
           COINBASE_PRIVATE_KEY: ${{ secrets.COINBASE_PRIVATE_KEY }}
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
-          SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
-        run: python main.py
