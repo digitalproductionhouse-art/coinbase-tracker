@@ -1,29 +1,36 @@
-import time, hmac, hashlib, requests, os, base64
+import os
+import time
+import jwt
+import requests
 
-# Load keys from GitHub secrets
-API_KEY = os.getenv("COINBASE_KEY_ID")
-API_SECRET = os.getenv("COINBASE_PRIVATE_KEY")  # this is your Coinbase API secret
-API_URL = "https://api.coinbase.com/v2/accounts"
+# Load from GitHub Secrets
+ORG_ID = os.environ["COINBASE_ORG_ID"]
+KEY_ID = os.environ["COINBASE_KEY_ID"]
+PRIVATE_KEY = os.environ["COINBASE_PRIVATE_KEY"]
+
+def get_jwt():
+    now = int(time.time())
+    payload = {
+        "sub": KEY_ID,      # Key ID
+        "iss": ORG_ID,      # Org ID
+        "nbf": now,
+        "exp": now + 300,   # token valid for 5 min
+    }
+    token = jwt.encode(
+        payload,
+        PRIVATE_KEY,
+        algorithm="ES256",
+        headers={"kid": KEY_ID}
+    )
+    return token
 
 def get_accounts():
-    timestamp = str(int(time.time()))
-    method = "GET"
-    request_path = "/v2/accounts"
-    body = ""
-
-    # Coinbase docs: signature = HMAC_SHA256(base64decode(secret), timestamp + method + path + body)
-    message = timestamp + method + request_path + body
-    secret = base64.b64decode(API_SECRET)  # secret must be base64 decoded
-    signature = hmac.new(secret, message.encode("utf-8"), hashlib.sha256).hexdigest()
-
+    jwt_token = get_jwt()
     headers = {
-        "CB-ACCESS-KEY": API_KEY,
-        "CB-ACCESS-SIGN": signature,
-        "CB-ACCESS-TIMESTAMP": timestamp,
-        "CB-VERSION": "2021-11-10",  # required header
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json"
     }
-
-    r = requests.get(API_URL, headers=headers)
+    r = requests.get("https://api.coinbase.com/api/v3/brokerage/accounts", headers=headers)
     r.raise_for_status()
     return r.json()
 
