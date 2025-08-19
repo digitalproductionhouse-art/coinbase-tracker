@@ -49,11 +49,8 @@ def update_sheet(balances):
     return r.text
 
 if __name__ == "__main__":
-    try:
-        balances = get_coinbase_balances()
-        print("Balances:", balances)
-        result = update_sheet(balances)
-        print("Sheet updated:", result)
-    except Exception as e:
-        print("Error:", str(e))
-        raise
+    print("ORG_ID:", COINBASE_ORG_ID)
+    print("KEY_ID:", COINBASE_KEY_ID)
+    print("First 40 chars of PRIVATE_KEY:", COINBASE_PRIVATE_KEY[:40])
+    token = get_jwt()
+    print("Generated JWT (first 80 chars):", token[:80])
