@@ -18,9 +18,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pyjwt
+  run: |
+    python -m pip install --upgrade pip
+    pip install requests pyjwt cryptography
+
 
       - name: Run script
         env:
