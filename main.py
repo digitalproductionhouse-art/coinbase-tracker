@@ -1,39 +1,41 @@
-import os
-import time
-import jwt
-import requests
+import time, hmac, hashlib, requests, os
 
-# Load from GitHub Secrets
-ORG_ID = os.environ["COINBASE_ORG_ID"]
-KEY_ID = os.environ["COINBASE_KEY_ID"]
-PRIVATE_KEY = os.environ["COINBASE_PRIVATE_KEY"]
-
-def get_jwt():
-    now = int(time.time())
-    payload = {
-        "sub": KEY_ID,      # Key ID
-        "iss": ORG_ID,      # Org ID
-        "nbf": now,
-        "exp": now + 300,   # token valid for 5 min
-    }
-    token = jwt.encode(
-        payload,
-        PRIVATE_KEY,
-        algorithm="ES256",
-        headers={"kid": KEY_ID}
-    )
-    return token
+# Load from GitHub Secrets (set these in Settings → Secrets → Actions)
+API_KEY = os.getenv("COINBASE_KEY_ID")       # your Key ID
+API_SECRET = os.getenv("COINBASE_API_SECRET")  # your API Secret
+API_URL = "https://api.coinbase.com/v2/accounts"
 
 def get_accounts():
-    jwt_token = get_jwt()
+    timestamp = str(int(time.time()))
+    method = "GET"
+    request_path = "/v2/accounts"
+    body = ""
+
+    # Build the prehash string
+    message = timestamp + method + request_path + body
+
+    # HMAC SHA256 with your API secret (as bytes)
+    signature = hmac.new(
+        API_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json"
+        "CB-ACCESS-KEY": API_KEY,
+        "CB-ACCESS-SIGN": signature,
+        "CB-ACCESS-TIMESTAMP": timestamp,
+        "CB-VERSION": "2021-11-10",
     }
-    r = requests.get("https://api.coinbase.com/api/v3/brokerage/accounts", headers=headers)
+
+    r = requests.get(API_URL, headers=headers)
     r.raise_for_status()
     return r.json()
 
 if __name__ == "__main__":
-    accounts = get_accounts()
-    print(accounts)
+    try:
+        accounts = get_accounts()
+        print("Accounts data:")
+        print(accounts)
+    except Exception as e:
+        print("Error fetching accounts:", e)
