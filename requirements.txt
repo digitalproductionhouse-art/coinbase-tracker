@@ -1,2 +1,2 @@
 requests
-pyjwt[crypto]
+cdp-sdk
