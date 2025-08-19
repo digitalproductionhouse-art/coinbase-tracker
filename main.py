@@ -1,56 +1,70 @@
-import os, time, json, requests, jwt
+import os
+import time
+import hmac
+import hashlib
+import base64
+import requests
+import json
 
-# === Load secrets from GitHub Actions ===
-COINBASE_KEY_ID     = os.getenv("COINBASE_KEY_ID")       # UUID like 0edea95f-...
-COINBASE_ORG_ID     = os.getenv("COINBASE_ORG_ID")       # orgs/... id
-COINBASE_PRIVATE_KEY= os.getenv("COINBASE_PRIVATE_KEY")  # full BEGIN/END block
-SHEET_WEBHOOK_URL   = os.getenv("SHEET_WEBHOOK_URL")     # Google Apps Script Webhook
+API_KEY = os.getenv("COINBASE_KEY_ID")
+API_SECRET = os.getenv("COINBASE_PRIVATE_KEY")
+WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL")
 
-# === Build Coinbase JWT ===
-def get_jwt():
-    now = int(time.time())
-    payload = {
-        "iss": COINBASE_ORG_ID,
-        "sub": COINBASE_KEY_ID,
-        "aud": "api.coinbase.com",
-        "iat": now,
-        "exp": now + 60
+def get_accounts():
+    timestamp = str(int(time.time()))
+    method = "GET"
+    request_path = "/v2/accounts"
+
+    # Coinbase v2 signature
+    message = timestamp + method + request_path
+    signature = hmac.new(
+        base64.b64decode(API_SECRET),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        "CB-ACCESS-KEY": API_KEY,
+        "CB-ACCESS-SIGN": signature,
+        "CB-ACCESS-TIMESTAMP": timestamp,
     }
-    token = jwt.encode(
-        payload,
-        COINBASE_PRIVATE_KEY,
-        algorithm="ES256",
-        headers={"kid": COINBASE_KEY_ID}  # <-- fix: force key id into header
-    )
-    return token
 
-# === Get balances from Coinbase ===
-def get_coinbase_balances():
-    url = "https://api.coinbase.com/api/v3/brokerage/accounts"
-    headers = {"Authorization": f"Bearer {get_jwt()}"}
+    url = "https://api.coinbase.com" + request_path
     r = requests.get(url, headers=headers)
     r.raise_for_status()
-    data = r.json()
+    return r.json()
 
-    balances = []
-    for acc in data.get("accounts", []):
-        if float(acc.get("available_balance", {}).get("value", 0)) > 0:
-            balances.append({
-                "asset": acc.get("currency"),
-                "balance": acc.get("available_balance", {}).get("value"),
-            })
-    return balances
+def send_to_webhook(data):
+    if not WEBHOOK_URL:
+        print("No webhook URL set, skipping Google Sheet push")
+        return
 
-# === Send balances to Google Sheet via webhook ===
-def update_sheet(balances):
-    payload = {"balances": balances}
-    r = requests.post(SHEET_WEBHOOK_URL, json=payload)
-    r.raise_for_status()
-    return r.text
+    r = requests.post(WEBHOOK_URL, json=data)
+    if r.status_code != 200:
+        print(f"Failed to send to webhook: {r.status_code} {r.text}")
+    else:
+        print("Sent balances to Google Sheet webhook")
 
 if __name__ == "__main__":
-    print("ORG_ID:", COINBASE_ORG_ID)
-    print("KEY_ID:", COINBASE_KEY_ID)
-    print("First 40 chars of PRIVATE_KEY:", COINBASE_PRIVATE_KEY[:40])
-    token = get_jwt()
-    print("Generated JWT (first 80 chars):", token[:80])
+    try:
+        accounts = get_accounts()
+        balances = []
+
+        for acct in accounts.get("data", []):
+            balance = acct.get("balance", {})
+            amount = balance.get("amount")
+            currency = balance.get("currency")
+
+            if amount and float(amount) > 0:  # only show non-zero balances
+                balances.append({
+                    "currency": currency,
+                    "amount": amount
+                })
+
+        print("Balances:", json.dumps(balances, indent=2))
+
+        send_to_webhook({"balances": balances})
+
+    except Exception as e:
+        print("Error:", e)
+        raise
