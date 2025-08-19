@@ -1,60 +1,71 @@
 import os
 import time
-import hmac
-import hashlib
-import base64
-import requests
 import sys
+import jwt
+import requests
 
-# Load keys from GitHub secrets
-API_KEY = os.getenv("COINBASE_KEY_ID")
-API_SECRET = os.getenv("COINBASE_PRIVATE_KEY")   # matches your repo secret name
-ORG_ID = os.getenv("COINBASE_ORG_ID")
+API_URL = "https://api.coinbase.com/api/v3/brokerage/accounts"
 
-API_URL = "https://api.coinbase.com/v2/accounts"
+# --- Load secrets ---
+ORG_ID = os.getenv("COINBASE_ORG_ID")          # e.g. 5c43035d-...
+KEY_ID = os.getenv("COINBASE_KEY_ID")          # e.g. 6651c734-...
+PRIVATE_KEY = os.getenv("COINBASE_PRIVATE_KEY")  # full PEM with real newlines
 
-# --- Debugging: show if secrets are missing ---
 def check_secrets():
-    if not API_KEY:
-        print("❌ Missing COINBASE_KEY_ID")
-    if not API_SECRET:
-        print("❌ Missing COINBASE_PRIVATE_KEY")
+    ok = True
     if not ORG_ID:
-        print("⚠️ Missing COINBASE_ORG_ID (may not be required for v2 API)")
-    if not API_KEY or not API_SECRET:
+        print("❌ Missing COINBASE_ORG_ID"); ok = False
+    if not KEY_ID:
+        print("❌ Missing COINBASE_KEY_ID"); ok = False
+    if not PRIVATE_KEY:
+        print("❌ Missing COINBASE_PRIVATE_KEY"); ok = False
+
+    # Sanity check: PRIVATE_KEY must look like a PEM
+    if PRIVATE_KEY and "BEGIN EC PRIVATE KEY" not in PRIVATE_KEY:
+        print("❌ COINBASE_PRIVATE_KEY does not look like a PEM (missing BEGIN/END lines). Paste the key with real line breaks.")
+        ok = False
+
+    if not ok:
         sys.exit(1)
 
-# --- Generate signed request to Coinbase ---
-def get_accounts():
-    timestamp = str(int(time.time()))
-    method = "GET"
-    request_path = "/v2/accounts"
-    body = ""
-
-    message = timestamp + method + request_path + body
-    try:
-        secret = base64.b64decode(API_SECRET)  # secret must be base64 decoded
-    except Exception as e:
-        print("❌ Error decoding API secret. Check COINBASE_PRIVATE_KEY formatting:", e)
-        sys.exit(1)
-
-    signature = hmac.new(secret, message.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    headers = {
-        "CB-ACCESS-KEY": API_KEY,
-        "CB-ACCESS-SIGN": signature,
-        "CB-ACCESS-TIMESTAMP": timestamp,
-        "CB-VERSION": "2021-11-10",
+def generate_jwt():
+    now = int(time.time())
+    payload = {
+        "sub": KEY_ID,     # API key id (UUID)
+        "iss": ORG_ID,     # org id (UUID)
+        "nbf": now,
+        "exp": now + 120,  # 2 minutes validity
     }
+    """
+    NOTE: If you ever store PRIVATE_KEY with escaped '\n' (not recommended),
+    you can uncomment the next line to convert them:
+    # pk = PRIVATE_KEY.replace("\\n", "\n")
+    """
+    token = jwt.encode(payload, PRIVATE_KEY, algorithm="ES256", headers={"kid": KEY_ID})
+    return token
 
-    r = requests.get(API_URL, headers=headers)
+def get_accounts():
+    token = generate_jwt()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    r = requests.get(API_URL, headers=headers, timeout=30)
+    # Helpful debug if anything fails
     if r.status_code != 200:
-        print("❌ Coinbase API error:", r.status_code, r.text)
+        print("❌ Coinbase API error:", r.status_code)
+        print("Body (first 500 chars):", r.text[:500])
         r.raise_for_status()
     return r.json()
 
 if __name__ == "__main__":
     check_secrets()
-    accounts = get_accounts()
-    print("✅ Accounts response:")
-    print(accounts)
+    data = get_accounts()
+    print("✅ Accounts response received.")
+    # Print a compact summary
+    accounts = data.get("accounts", [])
+    print(f"Accounts returned: {len(accounts)}")
+    for a in accounts[:10]:  # keep logs short
+        cur = a.get("currency")
+        bal = (a.get("available_balance") or {}).get("value")
+        print(f"- {cur}: {bal}")
