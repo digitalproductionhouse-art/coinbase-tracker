@@ -1,128 +1,198 @@
-import os, json, time, base64, sys
+#!/usr/bin/env python3
+import os, sys, json, time, random, math
+from typing import List, Dict, Any
 import requests
-from cdp.auth.utils.jwt import generate_jwt, JwtOptions
+import jwt  # PyJWT
 
-API_KEY_NAME        = os.getenv("COINBASE_KEY_ID", "")
-API_KEY_SECRET      = os.getenv("COINBASE_PRIVATE_KEY", "")
-WEBHOOK_URL         = os.getenv("SHEET_WEBHOOK_URL", "")
-SHEET_TOKEN         = os.getenv("SHEET_SHARED_SECRET", "")
-ORG_ID              = os.getenv("COINBASE_ORG_ID", "")  # just for sanity prints
+###############################################################################
+# Config via env (strip to avoid trailing newline bugs)
+###############################################################################
+COINBASE_KEY_ID      = (os.getenv("COINBASE_KEY_ID", "") or "").strip()
+COINBASE_PRIVATE_KEY = (os.getenv("COINBASE_PRIVATE_KEY", "") or "").strip()
+COINBASE_ORG_ID      = (os.getenv("COINBASE_ORG_ID", "") or "").strip()  # not required for brokerage auth, but we log it
 
-METHOD = "GET"
-HOST   = "api.coinbase.com"
-PATH   = "/api/v3/brokerage/accounts"
-URL    = f"https://{HOST}{PATH}"
+SHEET_WEBHOOK_URL    = (os.getenv("SHEET_WEBHOOK_URL", "") or "").strip()
+# Prefer reading shared secret from env; if you want a fallback literal, you can set it here:
+SHEET_SHARED_SECRET  = (os.getenv("SHEET_SHARED_SECRET", "") or "").strip()
 
-def b64url_json(b):
-    pad = "=" * (-len(b) % 4)
-    return json.loads(base64.urlsafe_b64decode(b + pad.encode()))
+COINBASE_HOST = "api.coinbase.com"
+ACCOUNTS_PATH = "/api/v3/brokerage/accounts"
+ACCOUNTS_URL  = f"https://{COINBASE_HOST}{ACCOUNTS_PATH}"
 
-def preview_secret(name, val):
-    if not val: return f"{name}: <empty>"
-    shortened = (val[:6] + "…" + val[-6:]) if len(val) > 18 else "<short>"
-    return f"{name}: {shortened} (len={len(val)})"
+HTTP_TIMEOUT = 30
 
-def validate_env():
+###############################################################################
+# Small utils
+###############################################################################
+def _mask(s: str, keep: int = 6) -> str:
+    if not s:
+        return "<empty>"
+    if len(s) <= keep:
+        return "*" * len(s)
+    return f"{s[:keep]}…{s[-keep:]}"
+
+def _is_pem(k: str) -> bool:
+    return "BEGIN" in k and "END" in k and "PRIVATE KEY" in k
+
+def debug_env() -> None:
     print("🔐 Env sanity:")
-    print("  ", preview_secret("COINBASE_KEY_ID", API_KEY_NAME))
-    print("  ", preview_secret("COINBASE_PRIVATE_KEY", API_KEY_SECRET))
-    if ORG_ID:
-        print("  ", preview_secret("COINBASE_ORG_ID", ORG_ID))
+    print(f"   COINBASE_KEY_ID: {_mask(COINBASE_KEY_ID, 6)} (len={len(COINBASE_KEY_ID)})")
+    print(f"   COINBASE_PRIVATE_KEY: {'PEM_ok' if _is_pem(COINBASE_PRIVATE_KEY) else '❌ not-PEM'} (len={len(COINBASE_PRIVATE_KEY)})")
+    print(f"   COINBASE_ORG_ID: {_mask(COINBASE_ORG_ID, 6)} (len={len(COINBASE_ORG_ID)})")
+    print(f"   SHEET_WEBHOOK_URL: {'set' if SHEET_WEBHOOK_URL else '❌ missing'}")
+    print(f"   SHEET_SHARED_SECRET: {'set' if SHEET_SHARED_SECRET else '❌ missing'}")
 
-    # KEY ID format check
-    parts = API_KEY_NAME.split("/")
-    ok_fmt = (len(parts) == 4 and parts[0] == "organizations" and parts[2] == "apiKeys")
-    if not ok_fmt:
-        print("❌ COINBASE_KEY_ID format must be: organizations/<org>/apiKeys/<key>")
-        sys.exit(1)
+    # newline diagnostics
+    if COINBASE_KEY_ID.endswith("\n") or "\n" in COINBASE_KEY_ID:
+        print("⚠️  COINBASE_KEY_ID contains newline(s) — stripping fixed this locally, but fix your secret value.")
+    if COINBASE_PRIVATE_KEY.strip() != COINBASE_PRIVATE_KEY:
+        print("⚠️  PRIVATE KEY had outer whitespace — stripped.")
+    if not _is_pem(COINBASE_PRIVATE_KEY):
+        print("❌ PRIVATE KEY is not a PEM block. It must look like '-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----'")
 
-    # NEWLINE check on the PEM
-    if "BEGIN" not in API_KEY_SECRET or "\n" not in API_KEY_SECRET:
-        print("❌ PRIVATE KEY likely lost newlines. Ensure the GitHub Secret is MULTILINE, not single line with literal \\n.")
-        print("   It must look like:")
-        print("   -----BEGIN EC PRIVATE KEY-----\\n...\\n-----END EC PRIVATE KEY-----")
-        sys.exit(1)
+def fail(msg: str, body: str = "") -> "NoReturn":  # type: ignore
+    print(msg)
+    if body:
+        print("Body:", body[:800])
+    sys.exit(1)
 
-def make_jwt():
-    # Bake in method/host/path — REQUIRED for brokerage endpoints
-    opts = JwtOptions(
-        api_key_id=API_KEY_NAME,
-        api_key_secret=API_KEY_SECRET,
-        request_method=METHOD,
-        request_host=HOST,
-        request_path=PATH,
-        expires_in=120
-    )
-    token = generate_jwt(opts)
+###############################################################################
+# Coinbase JWT (manual, includes method/host/path)
+###############################################################################
+def make_jwt(method: str, host: str, path: str) -> str:
+    now = int(time.time())
+    payload = {
+        "iss": "cdp",
+        "sub": COINBASE_KEY_ID,
+        "aud": ["cdp_service"],
+        "nbf": now,
+        "exp": now + 120,
+        "method": method,
+        "path": path,
+        "host": host,
+    }
+    headers = {
+        "alg": "ES256",
+        "kid": COINBASE_KEY_ID,
+        "typ": "JWT",
+        "nonce": str(random.randrange(10**15, 10**16)),
+    }
+    token = jwt.encode(payload, COINBASE_PRIVATE_KEY, algorithm="ES256", headers=headers)
 
-    # Decode header/payload (no verify) to show what we actually baked
-    try:
-        head_b64, body_b64, _sig = token.split(".")
-        header  = b64url_json(head_b64.encode())
-        payload = b64url_json(body_b64.encode())
-        now = int(time.time())
-        print("🧩 JWT header:", {k: ("***" if k == "kid" else v) for k, v in header.items()})
-        show = {k: payload.get(k) for k in ["iss","sub","aud","nbf","exp","method","path","host"]}
-        print("🧩 JWT payload (selected):", show)
-        # Quick checks
-        if show["method"] != METHOD or show["host"] != HOST or show["path"] != PATH:
-            print("❌ JWT missing/incorrect method/host/path. This will 401.")
-            print("   method:", show["method"], "host:", show["host"], "path:", show["path"])
-            print("   (SDK options may not be applied — ensure cdp-sdk is up to date and JwtOptions fields match.)")
-            sys.exit(1)
-        if not (now - 60 <= show["nbf"] <= now + 60) or not (now <= show["exp"] <= now + 300):
-            print("⚠️ JWT timing looks odd (possible clock skew). now:", now)
-    except Exception as e:
-        print("⚠️ Could not decode JWT for inspection:", e)
+    # Debug (safe subset)
+    print(f"🧩 JWT header: {{'alg': 'ES256', 'kid': '***', 'nonce': '{headers['nonce']}', 'typ': 'JWT'}}")
+    print(f"🧩 JWT payload (selected): {{'iss': 'cdp', 'sub': '{_mask(COINBASE_KEY_ID)}', 'aud': ['cdp_service'], "
+          f"'nbf': {payload['nbf']}, 'exp': {payload['exp']}, 'method': '{method}', 'path': '{path}', 'host': '{host}'}}")
+    if not all([method, host, path]):
+        print("❌ JWT missing/incorrect method/host/path. This will 401.")
     return token
 
-def get_accounts():
-    jwt_token = make_jwt()
-    headers = {"Authorization": f"Bearer {jwt_token}", "Accept": "application/json"}
-    print(f"➡️  Request: {METHOD} {URL}")
-    r = requests.get(URL, headers=headers, timeout=30)
+def coinbase_get(url: str, path: str) -> Dict[str, Any]:
+    token = make_jwt("GET", COINBASE_HOST, path)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
     if r.status_code == 401:
-        print("❌ Coinbase API error: 401 Unauthorized")
-        print("   Response body (first 300):", r.text[:300])
-        print("   Hints:")
-        print("   • Key ID must match the private key (no rotation/disabled key).")
-        print("   • PRIVATE KEY must be multiline with real newlines.")
-        print("   • JWT must include method/host/path exactly as requested.")
-        print("   • Runner clock must be correct (nbf/exp).")
-        sys.exit(1)
+        fail("❌ Coinbase API error: 401 (Unauthorized). Check KEY_ID (no trailing newline) and JWT claims.", r.text)
+    if r.status_code >= 400:
+        fail(f"❌ Coinbase API error: {r.status_code}", r.text)
     try:
-        r.raise_for_status()
-    except requests.HTTPError:
-        print("❌ Coinbase API error:", r.status_code)
-        print("Body (first 800):", r.text[:800])
-        raise
-    return r.json()
+        return r.json()
+    except Exception as e:
+        fail(f"❌ Failed to parse JSON from Coinbase: {e}", r.text)  # type: ignore
 
-def to_sheet_rows(accounts_payload):
-    rows = []
-    for a in accounts_payload.get("accounts", []):
-        name     = a.get("name") or a.get("currency") or ""
-        currency = a.get("currency") or ""
-        bal_str  = (a.get("available_balance") or {}).get("value") or "0"
-        try:
-            balance = float(bal_str)
-        except Exception:
-            balance = 0.0
-        rows.append({"asset": name, "balance": balance, "currency": currency, "usd": 0.0})
+###############################################################################
+# Data shaping
+###############################################################################
+def to_float(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            return float(x.strip())
+    except Exception:
+        return 0.0
+    return 0.0
+
+def extract_rows(accounts_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Coinbase /api/v3/brokerage/accounts returns:
+      { "accounts": [ { "uuid":..., "name":..., "currency": "BTC", "available_balance": { "value":"0.1","currency":"BTC" }, "hold":..., "default":..., "created_at":..., "updated_at":..., ... } ], "has_next": false, ... }
+    Some fields like USD value may be in a different endpoint; we derive USD using 'usd_value' if present, else 0.0.
+    """
+    rows: List[Dict[str, Any]] = []
+    accts = accounts_resp.get("accounts") or accounts_resp.get("data") or []
+    if not isinstance(accts, list):
+        print("⚠️  Unexpected accounts structure; 'accounts' is not a list. Will try to proceed.")
+        accts = []
+
+    for a in accts:
+        currency = (a.get("currency") or a.get("asset") or "").upper()
+        # balance may be nested
+        bal_obj = a.get("available_balance") or {}
+        balance_str = bal_obj.get("value") if isinstance(bal_obj, dict) else None
+        balance = balance_str if balance_str is not None else a.get("available_balance_value") or a.get("balance") or "0"
+        usd = a.get("usd_value")  # some responses include this; if not, leave 0 and let Sheet compute later if you add quotes
+
+        rows.append({
+            "asset": currency or (a.get("name") or ""),
+            "balance": str(balance),
+            "currency": currency or "",
+            "usd": to_float(usd),
+        })
     return rows
 
-if __name__ == "__main__":
-    validate_env()
-    data = get_accounts()
-    print("✅ Accounts payload (truncated pretty JSON):")
-    print(json.dumps(data, indent=2)[:1000])
+###############################################################################
+# Google Sheets webhook
+###############################################################################
+def post_to_sheet(rows: List[Dict[str, Any]]) -> None:
+    if not SHEET_WEBHOOK_URL:
+        fail("❌ SHEET_WEBHOOK_URL is not set.")
+    if not SHEET_SHARED_SECRET:
+        fail("❌ SHEET_SHARED_SECRET is not set (must match Apps Script SHARED_SECRET).")
 
-    if WEBHOOK_URL:
-        payload = {"token": SHEET_TOKEN or "", "rows": to_sheet_rows(data)}
-        try:
-            resp = requests.post(WEBHOOK_URL, json=payload, timeout=20)
-            print(f"📤 Posted to Google Sheet webhook. Status: {resp.status_code}")
-            if resp.status_code >= 400:
-                print("Body (first 800):", resp.text[:800])
-        except Exception as e:
-            print("⚠️ Webhook post failed:", e)
+    payload = {
+        "token": SHEET_SHARED_SECRET,
+        "rows": rows,
+    }
+    print(f"📤 Posting {len(rows)} rows to Google Sheets webhook...")
+    r = requests.post(SHEET_WEBHOOK_URL, data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=HTTP_TIMEOUT)
+    if r.status_code >= 400:
+        fail(f"❌ Webhook POST failed: {r.status_code}", r.text)
+    print("✅ Sheets webhook response:", r.text[:200])
+
+###############################################################################
+# Main
+###############################################################################
+def main() -> None:
+    debug_env()
+
+    if not COINBASE_KEY_ID or not COINBASE_PRIVATE_KEY:
+        fail("❌ Missing Coinbase credentials (COINBASE_KEY_ID / COINBASE_PRIVATE_KEY).")
+
+    print(f"🔎 GET {ACCOUNTS_URL}")
+    accounts_resp = coinbase_get(ACCOUNTS_URL, ACCOUNTS_PATH)
+
+    # Optional: print a compact summary for debugging
+    total_accounts = len(accounts_resp.get("accounts") or accounts_resp.get("data") or [])
+    print(f"📦 Received {total_accounts} account(s).")
+
+    rows = extract_rows(accounts_resp)
+    # Basic sanity on rows
+    nonzero = sum(1 for r in rows if to_float(r.get("usd")) > 0)
+    print(f"🧮 Prepared {len(rows)} row(s) for Sheets. USD>0 rows: {nonzero}")
+
+    post_to_sheet(rows)
+    print("🎉 Done.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        fail(f"💥 Unhandled error: {type(e).__name__}: {e}")
