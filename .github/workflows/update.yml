@@ -28,3 +28,4 @@ jobs:
           COINBASE_KEY_ID: ${{ secrets.COINBASE_KEY_ID }}
           COINBASE_PRIVATE_KEY: ${{ secrets.COINBASE_PRIVATE_KEY }}
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+          SHEET_SHARED_SECRET: ${{ secrets.SHEET_SHARED_SECRET }}
