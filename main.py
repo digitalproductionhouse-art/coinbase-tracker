@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Coinbase brokerage accounts -> Google Apps Script webhook poster.
+Coinbase → Google Sheets webhook poster (Portfolio, Trades, Prices).
 
 ENV VARS (required)
   COINBASE_KEY_ID        organizations/{org_id}/apiKeys/{key_id}
-  COINBASE_PRIVATE_KEY   PEM, multi-line. Do NOT wrap in quotes in GH secrets.
+  COINBASE_PRIVATE_KEY   PEM (multi-line, no quotes in GH secret)
+  SHEET_WEBHOOK_URL      Apps Script Web App /exec URL
+  SHEET_SHARED_SECRET    Shared secret string (also sent in body as "token")
 
-ENV VARS (optional, but needed for sheet)
-  SHEET_WEBHOOK_URL      Your Apps Script /exec URL
-  SHEET_SHARED_SECRET    Secret used to HMAC-SHA256 sign body as:
-                         X-Signature: sha256=<hexdigest>
-                         (Also sent as 'token' in body for temporary compatibility)
+Notes on Coinbase JWT:
+  iss="cdp", sub=COINBASE_KEY_ID, alg=ES256, header.kid=COINBASE_KEY_ID,
+  header.nonce=random, exp <= 120s, and payload.uri = "<METHOD> <HOST><PATH>"
 """
 
 from __future__ import annotations
@@ -24,23 +24,17 @@ import json
 import hmac
 import hashlib
 import secrets
-import textwrap
-from typing import Any, Dict, Tuple, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import jwt
 from cryptography.hazmat.primitives import serialization
 
-# ---- Config -----------------------------------------------------------------
-
 HOST = "api.coinbase.com"
-PATH = "/api/v3/brokerage/accounts"
-METHOD = "GET"
-TIMEOUT = 20  # seconds
-USER_AGENT = "coinbase-tracker/1.0 (+github-actions)"
+TIMEOUT = 20
+USER_AGENT = "coinbase-tracker/1.1 (+github-actions)"
 
-
-# ---- Utilities ---------------------------------------------------------------
+# -------------------- Utilities --------------------
 
 def _short(s: str, take: int = 6) -> str:
     if not s:
@@ -48,243 +42,305 @@ def _short(s: str, take: int = 6) -> str:
     return s if len(s) <= take * 2 else f"{s[:take]}…{s[-take:]}"
 
 
-def _read_env() -> Dict[str, Optional[str]]:
-    env = {
-        "COINBASE_KEY_ID": os.getenv("COINBASE_KEY_ID", "").strip(),
-        "COINBASE_PRIVATE_KEY": os.getenv("COINBASE_PRIVATE_KEY", "").strip(),
-        "SHEET_WEBHOOK_URL": os.getenv("SHEET_WEBHOOK_URL", "").strip(),
-        "SHEET_SHARED_SECRET": os.getenv("SHEET_SHARED_SECRET", "").strip(),
+def _env() -> Dict[str, str]:
+    e = {
+        "COINBASE_KEY_ID": (os.getenv("COINBASE_KEY_ID") or "").strip(),
+        "COINBASE_PRIVATE_KEY": (os.getenv("COINBASE_PRIVATE_KEY") or "").strip(),
+        "SHEET_WEBHOOK_URL": (os.getenv("SHEET_WEBHOOK_URL") or "").strip(),
+        "SHEET_SHARED_SECRET": (os.getenv("SHEET_SHARED_SECRET") or "").strip(),
     }
-    return env
+    return e
 
 
-def _validate_env(env: Dict[str, str]) -> None:
-    key_id = env["COINBASE_KEY_ID"]
-    pem = env["COINBASE_PRIVATE_KEY"]
-
-    problems = []
-
-    if not key_id:
-        problems.append("COINBASE_KEY_ID is missing")
-    elif not key_id.startswith("organizations/") or "/apiKeys/" not in key_id:
-        problems.append("COINBASE_KEY_ID must look like 'organizations/{org_id}/apiKeys/{key_id}'")
-
-    if not pem:
-        problems.append("COINBASE_PRIVATE_KEY is missing")
-    else:
-        if "-----BEGIN" not in pem or "PRIVATE KEY-----" not in pem:
-            problems.append("COINBASE_PRIVATE_KEY does not look like a PEM block")
-
-    if problems:
-        msg = "Env validation failed:\n  - " + "\n  - ".join(problems)
-        raise ValueError(msg)
+def _require_env(e: Dict[str, str]) -> None:
+    errors = []
+    if not e["COINBASE_KEY_ID"] or not e["COINBASE_KEY_ID"].startswith("organizations/") or "/apiKeys/" not in e["COINBASE_KEY_ID"]:
+        errors.append("COINBASE_KEY_ID must look like organizations/{org}/apiKeys/{key}")
+    if "-----BEGIN" not in e["COINBASE_PRIVATE_KEY"] or "PRIVATE KEY-----" not in e["COINBASE_PRIVATE_KEY"]:
+        errors.append("COINBASE_PRIVATE_KEY must be a PEM")
+    if not e["SHEET_WEBHOOK_URL"]:
+        errors.append("SHEET_WEBHOOK_URL missing")
+    if not e["SHEET_SHARED_SECRET"]:
+        errors.append("SHEET_SHARED_SECRET missing")
+    if errors:
+        raise ValueError("Missing/invalid env:\n  - " + "\n  - ".join(errors))
 
 
-def _load_private_key(pem: str):
-    pem_bytes = pem.encode("utf-8")
-    return serialization.load_pem_private_key(pem_bytes, password=None)
+def _load_priv(pem: str):
+    return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
 
 
-def build_jwt(key_name: str, private_key, method: str, host: str, path: str) -> str:
+def _jwt_for(method: str, path: str, key_name: str, priv) -> str:
     now = int(time.time())
-    uri = f"{method} {host}{path}"
     payload = {
         "sub": key_name,
         "iss": "cdp",
         "nbf": now,
         "exp": now + 120,
-        "uri": uri,
+        "uri": f"{method} {HOST}{path}",
     }
     headers = {
         "kid": key_name,
         "nonce": secrets.token_hex(8),
         "typ": "JWT",
     }
-    token = jwt.encode(payload, private_key, algorithm="ES256", headers=headers)
-    return token
+    return jwt.encode(payload, priv, algorithm="ES256", headers=headers)
 
 
-def _http_get_accounts(jwt_token: str) -> requests.Response:
-    url = f"https://{HOST}{PATH}"
+def _req(method: str, path: str, token: str, params: Dict[str, Any] | None = None) -> requests.Response:
+    url = f"https://{HOST}{path}"
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    return requests.get(url, headers=headers, timeout=TIMEOUT)
+    return requests.request(method, url, headers=headers, params=params, timeout=TIMEOUT)
 
 
-def _post_webhook(url: str, body: Dict[str, Any], shared_secret: Optional[str]) -> Tuple[int, str]:
+def _post_webhook(url: str, body: Dict[str, Any], shared_secret: str) -> Tuple[int, str]:
     data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-
-    # HMAC header (tiny tweak so Apps Script can verify)
-    if shared_secret:
-        sig = hmac.new(shared_secret.encode("utf-8"), data, hashlib.sha256).hexdigest()
-        headers["X-Signature"] = f"sha256={sig}"
-
-    resp = requests.post(url, data=data, headers=headers, timeout=TIMEOUT)
+    sig = hmac.new(shared_secret.encode("utf-8"), data, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "X-Signature": f"sha256={sig}",
+    }
+    r = requests.post(url, data=data, headers=headers, timeout=TIMEOUT)
     try:
-        text = resp.text
+        text = r.text
     except Exception:
         text = "<no body>"
-    return resp.status_code, text
+    return r.status_code, text
+
+# -------------------- Coinbase helpers --------------------
+
+def fetch_accounts(key_name: str, priv) -> List[Dict[str, Any]]:
+    path = "/api/v3/brokerage/accounts"
+    tok = _jwt_for("GET", path, key_name, priv)
+    r = _req("GET", path, tok, params={"limit": 250})
+    r.raise_for_status()
+    j = r.json()
+    return j.get("accounts") or j.get("data") or []
 
 
-def _to_rows(accounts: Any) -> List[Dict[str, Any]]:
-    """
-    Convert Coinbase 'accounts' into rows for the sheet.
-    Expected keys (best-effort):
-      - currency (e.g., 'BTC', 'ETH', 'USD')
-      - name (optional; some payloads have a display name)
-      - available_balance: { 'value': '0.12345', 'currency': 'BTC' }
-      - usd_value (not always present) -> if missing, we'll use 0
-    """
-    rows: List[Dict[str, Any]] = []
-    if not isinstance(accounts, list):
-        return rows
+def fetch_fills(key_name: str, priv, limit: int = 200) -> List[Dict[str, Any]]:
+    # Most recent fills first
+    path = "/api/v3/brokerage/orders/historical/fills"
+    tok = _jwt_for("GET", path, key_name, priv)
+    r = _req("GET", path, tok, params={"limit": min(limit, 250)})
+    if r.status_code == 401:
+        # one retry with fresh jwt
+        tok = _jwt_for("GET", path, key_name, priv)
+        r = _req("GET", path, tok, params={"limit": min(limit, 250)})
+    r.raise_for_status()
+    j = r.json()
+    return j.get("fills") or j.get("data") or []
 
-    for a in accounts:
-        try:
-            currency = (a.get("currency") or "").upper()
-            name = a.get("name") or currency
-            ab = a.get("available_balance") or {}
-            bal_val = ab.get("value") if isinstance(ab, dict) else None
-            balance = float(bal_val) if bal_val not in (None, "") else 0.0
 
-            # Some payloads include a USD valuation in different places; default to 0 if absent
-            usd_val = 0.0
-            if "usd_value" in a and a["usd_value"] not in (None, ""):
-                try:
-                    usd_val = float(a["usd_value"])
-                except Exception:
-                    usd_val = 0.0
-            elif isinstance(a.get("balance"), dict) and a["balance"].get("currency") == "USD":
-                # Rare shape: a.balance.value in USD
-                try:
-                    usd_val = float(a["balance"]["value"])
-                except Exception:
-                    usd_val = 0.0
-
-            rows.append({
-                "asset": name,
-                "balance": balance,
-                "currency": currency,
-                "usd": usd_val,
-            })
-        except Exception:
-            # Skip malformed account objects
+def _guess_products_from_accounts(accts: List[Dict[str, Any]]) -> List[str]:
+    symbols = set()
+    for a in accts:
+        cur = (a.get("currency") or a.get("balance", {}).get("currency") or "").upper()
+        if not cur or cur in {"", "USD"}:
             continue
+        # Treat USDC/USDT ~ 1 USD
+        if cur in {"USDC", "USDT"}:
+            symbols.add(f"{cur}-USD")
+            continue
+        symbols.add(f"{cur}-USD")
+    return sorted(symbols)
 
+
+def fetch_tickers(key_name: str, priv, product_ids: List[str]) -> Dict[str, float]:
+    prices: Dict[str, float] = {}
+    for pid in product_ids:
+        path = f"/api/v3/brokerage/market/products/{pid}/ticker"
+        tok = _jwt_for("GET", path, key_name, priv)
+        try:
+            r = _req("GET", path, tok)
+            if r.status_code >= 400:
+                continue
+            j = r.json()
+            # unified: price or best_ask/best_bid
+            p = None
+            if isinstance(j, dict):
+                if "price" in j:
+                    p = float(j["price"])
+                elif "best_ask" in j and j["best_ask"]:
+                    p = float(j["best_ask"])
+                elif "best_bid" in j and j["best_bid"]:
+                    p = float(j["best_bid"])
+            if p:
+                prices[pid] = p
+        except Exception:
+            pass
+        # be a little polite
+        time.sleep(0.05)
+    return prices
+
+
+# -------------------- Transforms --------------------
+
+def make_portfolio_rows(accts: List[Dict[str, Any]], tickers: Dict[str, float]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    now = int(time.time())
+    for a in accts:
+        currency = (a.get("currency") or a.get("balance", {}).get("currency") or "").upper()
+        bal = None
+        # Coinbase returns either balance as number in "available_balance" or "balance"
+        if "available_balance" in a and isinstance(a["available_balance"], dict):
+            bal = float(a["available_balance"].get("value") or 0.0)
+        elif "balance" in a:
+            # sometimes balance is { value, currency }
+            if isinstance(a["balance"], dict):
+                bal = float(a["balance"].get("value") or 0.0)
+            else:
+                try:
+                    bal = float(a["balance"])
+                except Exception:
+                    bal = 0.0
+        if bal is None:
+            bal = 0.0
+
+        # USD valuation
+        usd = 0.0
+        if currency in {"USD"}:
+            usd = bal
+        elif currency in {"USDC", "USDT"}:
+            usd = bal  # ~1:1
+        else:
+            pid = f"{currency}-USD"
+            px = tickers.get(pid)
+            if px:
+                usd = bal * px
+
+        rows.append({
+            "asset": currency,
+            "balance": bal,
+            "currency": currency,
+            "usd": round(usd, 2),
+            "asof": now,
+        })
+    # filter zero-balances to reduce clutter (optional)
+    rows = [r for r in rows if r["balance"] or r["usd"]]
+    # sort by usd desc
+    rows.sort(key=lambda r: r["usd"], reverse=True)
     return rows
 
 
-def _pretty_json(obj: Any) -> str:
-    return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
+def make_trade_rows(fills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for f in fills:
+        try:
+            row = {
+                "fill_id": f.get("trade_id") or f.get("fill_id") or f.get("order_fill_id") or "",
+                "time": f.get("trade_time") or f.get("time") or f.get("created_time") or "",
+                "product": f.get("product_id") or f.get("product") or "",
+                "side": (f.get("side") or "").upper(),
+                "size": float(f.get("size") or f.get("quantity") or 0.0),
+                "currency": (f.get("asset") or f.get("product_id", "").split("-")[0] if f.get("product_id") else "").upper(),
+                "price_usd": float(f.get("price") or f.get("price_usd") or 0.0),
+                "fee_usd": float(f.get("fee") or f.get("commission") or 0.0),
+                "gross_usd": 0.0,
+                "net_usd": 0.0,
+                "order_id": f.get("order_id") or "",
+            }
+            if row["price_usd"] and row["size"]:
+                row["gross_usd"] = round(row["price_usd"] * row["size"] * (1 if row["side"] == "SELL" else -1), 2)
+                row["net_usd"] = round(row["gross_usd"] - row["fee_usd"], 2)
+            rows.append(row)
+        except Exception:
+            # skip problematic fill
+            continue
+    return rows
 
 
-# ---- Main flow ---------------------------------------------------------------
+def make_price_rows(tickers: Dict[str, float]) -> List[Dict[str, Any]]:
+    now = int(time.time())
+    out = []
+    for pid, px in sorted(tickers.items()):
+        out.append({"symbol": pid, "price_usd": float(px), "asof": now})
+    return out
+
+# -------------------- Main --------------------
 
 def main() -> int:
-    env = _read_env()
+    env = _env()
 
-    key_id = env["COINBASE_KEY_ID"]
-    pem = env["COINBASE_PRIVATE_KEY"]
-    webhook = env["SHEET_WEBHOOK_URL"]
-    shared = env["SHEET_SHARED_SECRET"]
-
-    print("🔐 Env sanity:")
-    print(f"   COINBASE_KEY_ID: {_short(key_id)} (len={len(key_id) if key_id else 0})")
-    print(f"   COINBASE_PRIVATE_KEY: {'PEM_ok' if pem and '-----BEGIN' in pem and 'PRIVATE KEY-----' in pem else '❌ missing/suspect'} (len={len(pem) if pem else 0})")
-    print(f"   SHEET_WEBHOOK_URL: {'set' if webhook else 'not set'}")
-    print(f"   SHEET_SHARED_SECRET: {'set' if shared else '❌ missing'}")
+    print("🔐 Env check:")
+    print(f"   COINBASE_KEY_ID: {_short(env['COINBASE_KEY_ID'])} (len={len(env['COINBASE_KEY_ID'])})")
+    print(f"   COINBASE_PRIVATE_KEY: {'PEM_ok' if env['COINBASE_PRIVATE_KEY'].startswith('-----BEGIN') else 'suspect'} (len={len(env['COINBASE_PRIVATE_KEY'])})")
+    print(f"   SHEET_WEBHOOK_URL: {'set' if env['SHEET_WEBHOOK_URL'] else '❌ missing'}")
+    print(f"   SHEET_SHARED_SECRET: {'set' if env['SHEET_SHARED_SECRET'] else '❌ missing'}")
 
     try:
-        _validate_env(env)
+        _require_env(env)
     except Exception as e:
         print(f"❌ {e}")
         return 1
 
     try:
-        priv = _load_private_key(env["COINBASE_PRIVATE_KEY"])
+        priv = _load_priv(env["COINBASE_PRIVATE_KEY"])
     except Exception as e:
-        print("❌ Failed to parse COINBASE_PRIVATE_KEY as PEM:", str(e))
+        print(f"❌ Failed to parse private key: {e}")
         return 1
 
-    # Coinbase call
-    jwt1 = build_jwt(key_id, priv, METHOD, HOST, PATH)
-    print(f"🔎 Requesting https://{HOST}{PATH}")
-    print("🧩 JWT (selected):", {
-        "header.kid": _short(key_id),
-        "header.nonce": "set",
-        "payload.iss": "cdp",
-        "payload.sub": _short(key_id),
-        "payload.uri": f"{METHOD} {HOST}{PATH}",
-        "exp_in_s": 120,
-    })
-
-    resp = _http_get_accounts(jwt1)
-
-    if resp.status_code == 401:
-        print("⚠️  401 Unauthorized on first try. Retrying once with a fresh JWT…")
-        time.sleep(1)
-        jwt2 = build_jwt(key_id, priv, METHOD, HOST, PATH)
-        resp = _http_get_accounts(jwt2)
-
-    if resp.status_code >= 400:
-        try:
-            body_text = resp.text
-        except Exception:
-            body_text = "<no body>"
-        print(f"❌ Coinbase API error: {resp.status_code}.")
-        if resp.status_code == 401:
-            hints = textwrap.dedent(f"""
-            Troubleshooting tips:
-              • Ensure COINBASE_KEY_ID exactly equals: organizations/{{org_id}}/apiKeys/{{key_id}}
-                - No trailing newline/space. Current preview: {_short(key_id)}
-              • Make sure you used the *Secret API key* (server key), not a client key.
-              • JWT must include: iss="cdp", sub=COINBASE_KEY_ID, and uri="{METHOD} {HOST}{PATH}".
-              • System clock must be correct (token valid for ~120s).
-              • Private key must match the API key (algorithm ES256/ECDSA).
-            """).strip()
-            print(hints)
-        print("Body:", body_text)
-        return 1
-
-    # Success
+    # 1) Accounts → Portfolio
     try:
-        data = resp.json()
-    except Exception:
-        print("⚠️  Non-JSON response, returning raw text")
-        data = {"raw": resp.text}
+        accts = fetch_accounts(env["COINBASE_KEY_ID"], priv)
+        products = _guess_products_from_accounts(accts)
+        tickers = fetch_tickers(env["COINBASE_KEY_ID"], priv, products) if products else {}
+        portfolio_rows = make_portfolio_rows(accts, tickers)
 
-    accounts = data.get("accounts") or data.get("data") or []
-    print(f"✅ Got {len(accounts) if isinstance(accounts, list) else 'some'} accounts")
-    preview = _pretty_json(data)
-    print("📦 Sample payload:")
-    print(preview if len(preview) < 4000 else _pretty_json({"tip": "payload too large to show"}))
-
-    # ---- Webhook to Apps Script / Sheet -------------------------------------
-    if webhook:
-        rows = _to_rows(accounts)
-
-        post_body = {
-            "source": "coinbase-tracker",
-            "endpoint": f"https://{HOST}{PATH}",
-            "fetched_at": int(time.time()),
-            # What your Apps Script expects:
-            "rows": rows,
+        payload = {
+            "type": "portfolio",
+            "token": env["SHEET_SHARED_SECRET"],   # body token for Apps Script simple check
+            "rows": portfolio_rows,
         }
-
-        # TEMPORARY compatibility: if you still check payload.token in Apps Script,
-        # this will pass. Once you switch to HMAC-only verification, remove this line.
-        if shared:
-            post_body["token"] = shared
-
-        code, text = _post_webhook(webhook, post_body, shared if shared else None)
-        print(f"🪝 Webhook POST -> {code}")
+        code, text = _post_webhook(env["SHEET_WEBHOOK_URL"], payload, env["SHEET_SHARED_SECRET"])
+        print(f"🪝 Portfolio POST -> {code} ({len(portfolio_rows)} rows)")
         if code >= 400:
-            print("Webhook body:", text)
+            print("Body:", text)
+    except Exception as e:
+        print("❌ Portfolio step failed:", e)
+        # keep going to attempt trades/prices
+        tickers = {}
+
+    # 2) Fills → Trades
+    try:
+        fills = fetch_fills(env["COINBASE_KEY_ID"], priv, limit=200)
+        trade_rows = make_trade_rows(fills)
+        payload = {
+            "type": "trades",
+            "token": env["SHEET_SHARED_SECRET"],
+            "fills": trade_rows,
+        }
+        code, text = _post_webhook(env["SHEET_WEBHOOK_URL"], payload, env["SHEET_SHARED_SECRET"])
+        print(f"🪝 Trades POST -> {code} ({len(trade_rows)} rows)")
+        if code >= 400:
+            print("Body:", text)
+    except Exception as e:
+        print("❌ Trades step failed:", e)
+
+    # 3) Prices → Prices
+    try:
+        # If we didn’t have tickers yet (portfolio failed), try fetch a lightweight set
+        if not tickers:
+            # Attempt prices for common majors so sheet is still useful
+            majors = ["BTC-USD", "ETH-USD", "SOL-USD"]
+            tickers = fetch_tickers(env["COINBASE_KEY_ID"], priv, majors)
+        price_rows = make_price_rows(tickers)
+        payload = {
+            "type": "prices",
+            "token": env["SHEET_SHARED_SECRET"],
+            "prices": price_rows,
+        }
+        code, text = _post_webhook(env["SHEET_WEBHOOK_URL"], payload, env["SHEET_SHARED_SECRET"])
+        print(f"🪝 Prices POST -> {code} ({len(price_rows)} rows)")
+        if code >= 400:
+            print("Body:", text)
+    except Exception as e:
+        print("❌ Prices step failed:", e)
 
     return 0
 
